@@ -1,0 +1,29 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+
+# Deployment variables and credentials (never commit)
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+.env
+.env.*
+!.env.example
+
+# Local outputs
+otk.txt
+credentials.csv
+
+# Working artefacts kept by the build steps
+__pycache__/
+*.pyc
+.pytest_cache/
+node_modules/
+
+# The build directories are Terraform inputs (read by file()/filebase64()/fileset()),
+# therefore they must stay out of this list or apply fails on a missing package.

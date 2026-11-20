@@ -1,0 +1,207 @@
+set +x
+set -euo pipefail
+
+STAGE='${stage}'
+REGION='${region}'
+BUCKET='${bucket}'
+TERRAFORM_OBJECT_KEY='${terraform_object_key}'
+PROVIDER_OBJECT_KEY='${provider_object_key}'
+STATE_OBJECT_KEY='${state_object_key}'
+PLAN_OBJECT_KEY='${plan_object_key}'
+LOG_GROUP_NAME='${log_group_name}'
+TTL_IN_DAYS='${ttl_in_days}'
+OBS_AK='${ci_ak}'
+OBS_SK='${ci_sk}'
+
+export HW_ACCESS_KEY="$OBS_AK"
+export HW_SECRET_KEY="$OBS_SK"
+export TF_IN_AUTOMATION=1
+export NO_PROXY="myhuaweicloud.com,.myhuaweicloud.com"
+unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy || true
+
+WORK_DIR=$(mktemp -d)
+trap 'rm -rf "$WORK_DIR"' EXIT
+OBS_RESPONSE_FILE="$WORK_DIR/obs-response.txt"
+OBS_HTTP_CODE="000"
+
+obs_call() {
+  method="$1"
+  key="$2"
+  file_path=""
+  content_type=""
+  if [ "$#" -ge 3 ]; then file_path="$3"; fi
+  if [ "$#" -ge 4 ]; then content_type="$4"; fi
+
+  request_date=$(date -u '+%a, %d %b %Y %H:%M:%S GMT')
+  canonical_resource="/$BUCKET/$key"
+  string_to_sign=$(printf '%s\n\n%s\n%s\n%s' "$method" "$content_type" "$request_date" "$canonical_resource")
+  signature=$(printf '%s' "$string_to_sign" | openssl sha1 -hmac "$OBS_SK" -binary | base64 | tr -d '\n')
+  url="https://$BUCKET.obs.$REGION.myhuaweicloud.com/$key"
+  OBS_HTTP_CODE="000"
+  : > "$OBS_RESPONSE_FILE"
+
+  if [ "$method" = "GET" ]; then
+    OBS_HTTP_CODE=$(curl -sS -o "$file_path" -w "%%{http_code}" \
+      -H "Date: $request_date" \
+      -H "Authorization: OBS $OBS_AK:$signature" \
+      "$url") || OBS_HTTP_CODE="000"
+  elif [ "$method" = "PUT" ]; then
+    OBS_HTTP_CODE=$(curl -sS -o "$OBS_RESPONSE_FILE" -w "%%{http_code}" -X PUT \
+      -H "Date: $request_date" \
+      -H "Content-Type: $content_type" \
+      -H "Authorization: OBS $OBS_AK:$signature" \
+      --data-binary "@$file_path" \
+      "$url") || OBS_HTTP_CODE="000"
+  elif [ "$method" = "DELETE" ]; then
+    OBS_HTTP_CODE=$(curl -sS -o "$OBS_RESPONSE_FILE" -w "%%{http_code}" -X DELETE \
+      -H "Date: $request_date" \
+      -H "Authorization: OBS $OBS_AK:$signature" \
+      "$url") || OBS_HTTP_CODE="000"
+  else
+    echo "[obs] unsupported method=$method" >&2
+    exit 1
+  fi
+}
+
+obs_get_required() {
+  key="$1"
+  destination="$2"
+  obs_call GET "$key" "$destination"
+  echo "[obs] GET key=$key status=$OBS_HTTP_CODE"
+  if [ "$OBS_HTTP_CODE" != "200" ]; then
+    echo "[obs] required object download failed" >&2
+    exit 1
+  fi
+}
+
+obs_get_optional() {
+  key="$1"
+  destination="$2"
+  obs_call GET "$key" "$destination"
+  echo "[obs] GET optional key=$key status=$OBS_HTTP_CODE"
+  if [ "$OBS_HTTP_CODE" = "200" ]; then
+    return 0
+  fi
+  rm -f "$destination"
+  if [ "$OBS_HTTP_CODE" = "404" ]; then
+    return 1
+  fi
+  echo "[obs] optional object query failed" >&2
+  exit 1
+}
+
+obs_put() {
+  key="$1"
+  source_file="$2"
+  content_type="$3"
+  obs_call PUT "$key" "$source_file" "$content_type"
+  echo "[obs] PUT key=$key status=$OBS_HTTP_CODE"
+  if [ "$OBS_HTTP_CODE" != "200" ]; then
+    echo "[obs] object upload failed" >&2
+    exit 1
+  fi
+}
+
+obs_delete_optional() {
+  key="$1"
+  obs_call DELETE "$key"
+  echo "[obs] DELETE key=$key status=$OBS_HTTP_CODE"
+  if [ "$OBS_HTTP_CODE" != "204" ] && [ "$OBS_HTTP_CODE" != "404" ]; then
+    echo "[obs] object deletion failed" >&2
+    exit 1
+  fi
+}
+
+BIN_DIR="$WORK_DIR/bin"
+MIRROR_DIR="$WORK_DIR/provider-mirror"
+PROVIDER_UNPACK_DIR="$WORK_DIR/provider-unpack"
+PLUGIN_CACHE_DIR="$WORK_DIR/plugin-cache"
+mkdir -p "$BIN_DIR" "$PROVIDER_UNPACK_DIR" "$PLUGIN_CACHE_DIR"
+mkdir -p "$MIRROR_DIR/registry.terraform.io/huaweicloud/huaweicloud/1.95.0/linux_amd64"
+
+obs_get_required "$TERRAFORM_OBJECT_KEY" "$WORK_DIR/terraform.zip"
+obs_get_required "$PROVIDER_OBJECT_KEY" "$WORK_DIR/provider.zip"
+unzip -q "$WORK_DIR/terraform.zip" -d "$BIN_DIR"
+unzip -q "$WORK_DIR/provider.zip" -d "$PROVIDER_UNPACK_DIR"
+provider_bin=$(find "$PROVIDER_UNPACK_DIR" -maxdepth 1 -type f -name 'terraform-provider-huaweicloud_v1.95.0*' | head -1)
+if [ -z "$provider_bin" ]; then
+  echo "[toolchain] provider binary missing from archive" >&2
+  exit 1
+fi
+cp "$provider_bin" "$MIRROR_DIR/registry.terraform.io/huaweicloud/huaweicloud/1.95.0/linux_amd64/terraform-provider-huaweicloud_v1.95.0"
+chmod +x "$BIN_DIR/terraform" "$MIRROR_DIR/registry.terraform.io/huaweicloud/huaweicloud/1.95.0/linux_amd64/terraform-provider-huaweicloud_v1.95.0"
+export PATH="$BIN_DIR:$PATH"
+export TF_PLUGIN_CACHE_DIR="$PLUGIN_CACHE_DIR"
+
+echo "[toolchain] $(terraform version | head -1), provider=1.95.0, stage=$STAGE"
+
+TF_DIR="$(pwd)/sample-infra"
+if [ ! -d "$TF_DIR" ]; then
+  echo "[terraform] sample-infra directory not found" >&2
+  exit 1
+fi
+rm -rf "$TF_DIR/.terraform" "$TF_DIR/.terraform.lock.hcl"
+terraform -chdir="$TF_DIR" init -input=false -no-color -plugin-dir="$MIRROR_DIR"
+
+STATE_FILE="$TF_DIR/terraform.tfstate"
+PLAN_FILE="$WORK_DIR/sample-infra.tfplan"
+
+case "$STAGE" in
+  validate)
+    terraform -chdir="$TF_DIR" fmt -check -no-color
+    terraform -chdir="$TF_DIR" validate -no-color
+    echo "VALIDATE_OK"
+    ;;
+
+  plan)
+    if obs_get_optional "$STATE_OBJECT_KEY" "$STATE_FILE"; then
+      echo "[terraform] existing state restored"
+    else
+      echo "[terraform] no existing state; planning from an empty state"
+    fi
+    terraform -chdir="$TF_DIR" plan -input=false -no-color -out="$PLAN_FILE" \
+      -var="region=$REGION" \
+      -var="log_group_name=$LOG_GROUP_NAME" \
+      -var="ttl_in_days=$TTL_IN_DAYS"
+    obs_put "$PLAN_OBJECT_KEY" "$PLAN_FILE" "application/octet-stream"
+    if [ -f "$STATE_FILE" ]; then
+      obs_put "$STATE_OBJECT_KEY" "$STATE_FILE" "application/json"
+    fi
+    echo "PLAN_OK"
+    ;;
+
+  apply)
+    obs_get_required "$PLAN_OBJECT_KEY" "$PLAN_FILE"
+    if obs_get_optional "$STATE_OBJECT_KEY" "$STATE_FILE"; then
+      echo "[terraform] planned state restored"
+    else
+      echo "[terraform] applying plan created from an empty state"
+    fi
+    terraform -chdir="$TF_DIR" apply -input=false -no-color "$PLAN_FILE"
+    if [ ! -f "$STATE_FILE" ]; then
+      echo "[terraform] apply completed without a state file" >&2
+      exit 1
+    fi
+    obs_put "$STATE_OBJECT_KEY" "$STATE_FILE" "application/json"
+    echo "APPLY_OK"
+    ;;
+
+  destroy)
+    if ! obs_get_optional "$STATE_OBJECT_KEY" "$STATE_FILE"; then
+      echo "[terraform] state object required for destroy is missing" >&2
+      exit 1
+    fi
+    terraform -chdir="$TF_DIR" destroy -input=false -auto-approve -no-color \
+      -var="region=$REGION" \
+      -var="log_group_name=$LOG_GROUP_NAME" \
+      -var="ttl_in_days=$TTL_IN_DAYS"
+    obs_delete_optional "$STATE_OBJECT_KEY"
+    obs_delete_optional "$PLAN_OBJECT_KEY"
+    echo "DESTROY_OK"
+    ;;
+
+  *)
+    echo "[terraform] unknown stage=$STAGE" >&2
+    exit 1
+    ;;
+esac
